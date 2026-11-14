@@ -1,0 +1,230 @@
+
+name: Copy All Upstream Releases
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  copy-releases:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Copy upstream releases
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          FORK: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import tempfile
+          from urllib.parse import quote
+
+          FORK = os.environ["FORK"]
+
+          def run(args):
+              return subprocess.run(
+                  args,
+                  check=True,
+                  text=True
+              )
+
+          def output(args):
+              return subprocess.check_output(
+                  args,
+                  text=True
+              ).strip()
+
+          def flatten(items):
+              for item in items:
+                  if isinstance(item, list):
+                      yield from flatten(item)
+                  else:
+                      yield item
+
+          # Automatically identify the original repository.
+          upstream = output([
+              "gh", "api",
+              f"repos/{FORK}",
+              "--jq", ".parent.full_name"
+          ])
+
+          if not upstream or upstream == "null":
+              raise RuntimeError(
+                  "Could not identify the original fork repository."
+              )
+
+          print("================================")
+          print("UPSTREAM RELEASE BACKUP")
+          print("================================")
+          print(f"Original: {upstream}")
+          print(f"Destination: {FORK}")
+
+          # Add the original repository as a Git remote.
+          run([
+              "git", "remote", "add",
+              "upstream",
+              f"https://github.com/{upstream}.git"
+          ])
+
+          # Retrieve every published upstream release.
+          print("\nRetrieving all upstream releases...")
+
+          raw = output([
+              "gh", "api", "--paginate", "--slurp",
+              f"repos/{upstream}/releases"
+          ])
+
+          releases = list(flatten(json.loads(raw)))
+
+          print(f"Found {len(releases)} releases.")
+
+          # Identify the original latest stable release.
+          latest_result = subprocess.run(
+              [
+                  "gh", "api",
+                  f"repos/{upstream}/releases/latest",
+                  "--jq", ".tag_name"
+              ],
+              capture_output=True,
+              text=True
+          )
+
+          latest_tag = (
+              latest_result.stdout.strip()
+              if latest_result.returncode == 0
+              else None
+          )
+
+          created = 0
+          skipped = 0
+
+          for release in releases:
+              tag = release["tag_name"]
+              title = release.get("name") or tag
+
+              print(f"\nProcessing: {tag}")
+              print(f"Title: {title}")
+
+              # Check whether this release already exists.
+              existing = subprocess.run(
+                  [
+                      "gh", "release", "view",
+                      tag, "--repo", FORK
+                  ],
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL
+              )
+
+              if existing.returncode == 0:
+                  print("Already copied. Skipping.")
+                  skipped += 1
+                  continue
+
+              # Ensure the release tag exists in the fork.
+              tag_path = (
+                  f"repos/{FORK}/git/ref/tags/"
+                  f"{quote(tag, safe='')}"
+              )
+
+              tag_check = subprocess.run(
+                  ["gh", "api", tag_path],
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL
+              )
+
+              if tag_check.returncode != 0:
+                  print(f"Creating missing release tag: {tag}")
+
+                  temp_ref = f"refs/tmp/release-tags/{tag}"
+
+                  run([
+                      "git", "fetch", "--force", "upstream",
+                      f"+refs/tags/{tag}:{temp_ref}"
+                  ])
+
+                  sha = output([
+                      "git", "rev-parse",
+                      f"{temp_ref}^{{commit}}"
+                  ])
+
+                  run([
+                      "gh", "api", "--method", "POST",
+                      f"repos/{FORK}/git/refs",
+                      "-f", f"ref=refs/tags/{tag}",
+                      "-f", f"sha={sha}"
+                  ])
+
+              # Download assets to temporary runner storage.
+              with tempfile.TemporaryDirectory() as temp:
+                  assets_dir = os.path.join(temp, "assets")
+                  os.makedirs(assets_dir)
+
+                  assets = release.get("assets", [])
+
+                  if assets:
+                      print(f"Downloading {len(assets)} assets...")
+
+                      run([
+                          "gh", "release", "download", tag,
+                          "--repo", upstream,
+                          "--dir", assets_dir,
+                          "--clobber"
+                      ])
+
+                  # Save the original release notes.
+                  notes_path = os.path.join(temp, "notes.md")
+
+                  with open(
+                      notes_path, "w", encoding="utf-8"
+                  ) as f:
+                      f.write(release.get("body") or "")
+
+                  # Create the release in the fork.
+                  args = [
+                      "gh", "release", "create", tag,
+                      "--repo", FORK,
+                      "--title", title,
+                      "--notes-file", notes_path,
+                      "--verify-tag"
+                  ]
+
+                  if release.get("prerelease"):
+                      args.append("--prerelease")
+
+                  if tag == latest_tag:
+                      args.append("--latest")
+                  else:
+                      args.append("--latest=false")
+
+                  # Attach every downloaded asset.
+                  for filename in sorted(os.listdir(assets_dir)):
+                      filepath = os.path.join(assets_dir, filename)
+
+                      if os.path.isfile(filepath):
+                          args.append(filepath)
+
+                  run(args)
+
+              print(f"Successfully copied: {tag}")
+              created += 1
+
+          print("\n================================")
+          print("TRANSFER COMPLETE")
+          print("================================")
+          print(f"Created releases: {created}")
+          print(f"Skipped releases: {skipped}")
+          print(f"Total upstream releases: {len(releases)}")
+          PY
